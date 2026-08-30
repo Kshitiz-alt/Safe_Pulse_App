@@ -1,0 +1,227 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:developer';
+import 'dart:ui';
+
+import 'package:flutter/material.dart';
+import 'package:flutter_background_service/flutter_background_service.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:http/http.dart' as http;
+import 'package:Safe_pulse/Api/ApiService.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:stomp_dart_client/stomp_dart_client.dart';
+
+Future<void> initializeService() async {
+  final service = FlutterBackgroundService();
+  await service.configure(
+    androidConfiguration: AndroidConfiguration(
+      onStart: onStart,
+      autoStart: true,
+      isForegroundMode: false,
+      autoStartOnBoot: true,
+      notificationChannelId: 'location_service', // Must match Android channel
+      initialNotificationTitle: 'Location Tracking',
+      initialNotificationContent: 'Running in background',
+    ),
+    iosConfiguration: IosConfiguration(
+      autoStart: true,
+      onForeground: onStart,
+      onBackground: onIosBackground,
+    ),
+  );
+}
+
+@pragma('vm:entry-point')
+Future<bool> onIosBackground(ServiceInstance service) async {
+  log('Service is running in the background');
+  WidgetsFlutterBinding.ensureInitialized();
+  DartPluginRegistrant.ensureInitialized();
+  return true;
+}
+
+@pragma('vm:entry-point')
+void onStart(ServiceInstance service) async {
+  log('Service started');
+  DartPluginRegistrant.ensureInitialized();
+
+  // Initialize WebSocket client
+  StompClient? stompClient;
+  String? userEmail;
+  String? userId;
+  bool isWebSocketConnected = false;
+  final List<Map<String, dynamic>> pendingLocations = [];
+
+  // Get user data from SharedPreferences
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    userEmail = prefs.getString("username");
+    userId = prefs.getString("userId");
+  } catch (e) {
+    log("Error getting user data: $e");
+  }
+
+  // Function to send pending locations via API
+  Future<void> sendPendingLocations() async {
+    if (pendingLocations.isEmpty || userEmail == null) return;
+
+    try {
+      final url = Uri.parse(
+          '${ApiService.baseUrl}/api/rest/bulk-location-save?username=$userEmail');
+      final headers = {'Content-Type': 'application/json'};
+      final body = jsonEncode(pendingLocations);
+
+      final response = await http.post(url, headers: headers, body: body);
+
+      if (response.statusCode == 200) {
+        log("Successfully sent ${pendingLocations.length} pending locations");
+        pendingLocations.clear();
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.remove('pending_locations');
+      } else {
+        log("Failed to send pending locations: ${response.statusCode}");
+      }
+    } catch (e) {
+      log("Error sending pending locations: $e");
+    }
+  }
+
+  // Load pending locations from storage
+  Future<void> loadPendingLocations() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final pending = prefs.getString('pending_locations');
+      if (pending != null) {
+        final List<dynamic> decoded = jsonDecode(pending);
+        pendingLocations.addAll(decoded.cast<Map<String, dynamic>>());
+        log("Loaded ${pendingLocations.length} pending locations from storage");
+      }
+    } catch (e) {
+      log("Error loading pending locations: $e");
+    }
+  }
+
+  // Save pending locations to storage
+  Future<void> savePendingLocations() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('pending_locations', jsonEncode(pendingLocations));
+      log("Saved ${pendingLocations.length} pending locations to storage");
+    } catch (e) {
+      log("Error saving pending locations: $e");
+    }
+  }
+
+  // Setup WebSocket connection
+  void connectWebSocket() {
+    stompClient = StompClient(
+      config: StompConfig.sockJS(
+        url: '${ApiService.baseUrl}//ws-location',
+        onConnect: (StompFrame frame) {
+          log("WebSocket connected");
+          isWebSocketConnected = true;
+          // Try to send any pending locations when connection is restored
+          sendPendingLocations();
+        },
+        onDisconnect: (frame) {
+          log("WebSocket disconnected");
+          isWebSocketConnected = false;
+        },
+        onWebSocketError: (dynamic error) {
+          log("WebSocket error: $error");
+          isWebSocketConnected = false;
+        },
+        reconnectDelay: const Duration(seconds: 5),
+      ),
+    );
+    stompClient?.activate();
+  }
+
+  // Load any pending locations at startup
+  await loadPendingLocations();
+
+  // Connect to WebSocket
+  connectWebSocket();
+
+  if (service is AndroidServiceInstance) {
+    service.setAsForegroundService();
+    service.on('setAsForeground').listen((event) {
+      service.setAsForegroundService();
+    });
+    service.on('setAsBackground').listen((event) {
+      service.setAsBackgroundService();
+    });
+  }
+
+  service.on('stopService').listen((event) {
+    stompClient?.deactivate();
+    service.stopSelf();
+  });
+
+  Timer.periodic(const Duration(seconds: 1), (timer) async {
+    if (await Permission.locationAlways.isDenied) {
+      if (service is AndroidServiceInstance) {
+        if (await service.isForegroundService()) {
+          await service.setForegroundNotificationInfo(
+            title: "Permission Denied",
+            content: "Waiting for location permission",
+          );
+        }
+      }
+      log("Waiting for location permission");
+      service.invoke('update');
+    } else {
+      try {
+        Position position = await Geolocator.getCurrentPosition(
+            desiredAccuracy: LocationAccuracy.high);
+
+        if (service is AndroidServiceInstance) {
+          if (await service.isForegroundService()) {
+            await service.setForegroundNotificationInfo(
+              title: "Your location",
+              content: "${position.latitude},${position.longitude}",
+            );
+          }
+        }
+
+        log("Background service running: ${position.latitude},${position.longitude}");
+        service.invoke('update');
+
+        // Prepare location data
+        final location = {
+          'latitude': position.latitude,
+          'longitude': position.longitude,
+          // 'timestamp': DateTime.now().toIso8601String(),
+          'userId': userId,
+        };
+
+        // Try to send via WebSocket if connected
+        if (isWebSocketConnected && userId != null && userEmail != null) {
+          try {
+            stompClient?.send(
+              destination: '/app/update-location',
+              body: jsonEncode(location),
+            );
+            log("Location data sent via WebSocket: $userId,${position.latitude}");
+          } catch (e) {
+            log("WebSocket send error, storing locally: $e");
+            pendingLocations.add(location);
+            await savePendingLocations();
+            connectWebSocket();
+          }
+        } else {
+          log("WebSocket not connected or user data missing - storing locally");
+          pendingLocations.add(location);
+          await savePendingLocations();
+
+          // Try to reconnect if not connected
+          if (!isWebSocketConnected) {
+            connectWebSocket();
+          }
+        }
+      } catch (e) {
+        log("Error in background service: $e");
+      }
+    }
+  });
+}

@@ -1,0 +1,439 @@
+import 'dart:math';
+
+import 'package:flutter/material.dart';
+import 'package:google_maps_flutter/google_maps_flutter.dart';
+import 'package:stomp_dart_client/stomp_dart_client.dart';
+import 'dart:convert';
+import 'package:intl/intl.dart';
+import 'package:uuid/uuid.dart';
+
+class LiveTrackingPagemain extends StatefulWidget {
+  final String requestingUserId;
+  final String userIdToTrack;
+
+  const LiveTrackingPagemain({
+    Key? key,
+    required this.requestingUserId,
+    required this.userIdToTrack,
+  }) : super(key: key);
+
+  @override
+  _LiveTrackingPagemainState createState() => _LiveTrackingPagemainState();
+}
+
+class _LiveTrackingPagemainState extends State<LiveTrackingPagemain> {
+  late GoogleMapController _mapController;
+  final Set<Marker> _markers = {};
+  final Set<Circle> _footprints = {};
+  final Set<Polyline> _pathLines = {};
+  final List<LatLng> _pathPoints = [];
+
+  late StompClient _stompClient;
+  bool _isConnected = false;
+  DateTime? _lastUpdateTime;
+  DateTime? _trackingStartTime;
+  double _totalDistance = 0;
+  LatLng? _currentPosition;
+
+  final Color _trackedUserColor = Colors.blue;
+  final DateFormat _timeFormat = DateFormat('hh:mm:ss a');
+  final DateFormat _dateFormat = DateFormat('MMM d, y');
+  final ScrollController _scrollController = ScrollController();
+
+  @override
+  void initState() {
+    super.initState();
+    _trackingStartTime = DateTime.now();
+    _connectWebSocket();
+  }
+
+  @override
+  void dispose() {
+    _stompClient.deactivate();
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  void _connectWebSocket() {
+    _stompClient = StompClient(
+      config: StompConfig.sockJS(
+        url: '${ApiService.baseUrl}/ws-location',
+        onConnect: (frame) {
+          setState(() => _isConnected = true);
+          _sendTrackingRequest();
+          _subscribeToLocationUpdatesHistory();
+          _subscribeToLocationUpdates();
+        },
+        onDisconnect: (frame) => setState(() => _isConnected = false),
+        reconnectDelay: Duration(seconds: 5),
+      ),
+    );
+    _stompClient.activate();
+  }
+
+  void _subscribeToLocationUpdates() {
+    _stompClient.subscribe(
+      destination: '/topic/location-updates',
+      callback: (frame) {
+        if (frame.body != null) {
+          try {
+            final data = jsonDecode(frame.body!);
+            print("gfdbhgfhjngjmhgkmgkm ${jsonDecode(frame.body!)}");
+            if (data['user']['userId'] == widget.userIdToTrack) {
+              final lat = data['latitude']?.toDouble() ?? 0.0;
+              final lng = data['longitude']?.toDouble() ?? 0.0;
+              final position = LatLng(lat, lng);
+
+              setState(() {
+                _lastUpdateTime = DateTime.now();
+                _currentPosition = position;
+                _updatePath(position);
+              });
+
+              _updateMap(position);
+              _addFootprint(position);
+            }
+          } catch (e) {
+            print('Error processing location: $e');
+          }
+        }
+      },
+    );
+  }
+
+  void _subscribeToLocationUpdatesHistory() {
+    _stompClient.subscribe(
+      destination: '/topic/user-locations',
+      callback: (frame) {
+        if (frame.body != null) {
+          try {
+            final List<dynamic> data = jsonDecode(frame.body!);
+            print("location history----- ${jsonDecode(frame.body!)}");
+
+            setState(() {
+              // Clear existing path data
+              _pathPoints.clear();
+              _pathLines.clear();
+              _totalDistance = 0;
+
+              // Process historical data in chronological order (assuming data[0] is oldest)
+              for (final location in data) {
+                final lat = location['latitude']?.toDouble() ?? 0.0;
+                final lng = location['longitude']?.toDouble() ?? 0.0;
+                final position = LatLng(lat, lng);
+                _pathPoints.add(position);
+
+                // Calculate distance if we have previous points
+                if (_pathPoints.length > 1) {
+                  final prev = _pathPoints[_pathPoints.length - 2];
+                  _totalDistance += calculateDistance(prev.latitude,
+                      prev.longitude, position.latitude, position.longitude);
+                }
+              }
+
+              // Create polyline from all points
+              if (_pathPoints.isNotEmpty) {
+                _pathLines.add(Polyline(
+                  polylineId: PolylineId('historical_path'),
+                  points: List<LatLng>.from(_pathPoints),
+                  color: _trackedUserColor,
+                  width: 3,
+                ));
+
+                // Move camera to show entire path if we have points
+                if (_pathPoints.isNotEmpty) {
+                  _mapController?.animateCamera(CameraUpdate.newLatLngBounds(
+                      _boundsFromLatLngList(_pathPoints), 50.0));
+                }
+              }
+            });
+          } catch (e) {
+            print('Error processing location history: $e');
+          }
+        }
+      },
+    );
+  }
+
+// Helper function to calculate bounds from list of points
+  LatLngBounds _boundsFromLatLngList(List<LatLng> list) {
+    double? x0, x1, y0, y1;
+    for (LatLng latLng in list) {
+      if (x0 == null) {
+        x0 = x1 = latLng.latitude;
+        y0 = y1 = latLng.longitude;
+      } else {
+        if (latLng.latitude > x1!) x1 = latLng.latitude;
+        if (latLng.latitude < x0) x0 = latLng.latitude;
+        if (latLng.longitude > y1!) y1 = latLng.longitude;
+        if (latLng.longitude < y0!) y0 = latLng.longitude;
+      }
+    }
+    return LatLngBounds(
+      northeast: LatLng(x1!, y1!),
+      southwest: LatLng(x0!, y0!),
+    );
+  }
+
+  void _updatePath(LatLng newPosition) {
+    _pathPoints.add(newPosition);
+
+    if (_pathPoints.length > 1) {
+      final prev = _pathPoints[_pathPoints.length - 2];
+      final distance = calculateDistance(prev.latitude, prev.longitude,
+          newPosition.latitude, newPosition.longitude);
+      _totalDistance += distance;
+    }
+
+    _pathLines.clear();
+    if (_pathPoints.length > 1) {
+      _pathLines.add(Polyline(
+        polylineId: PolylineId('user_path'),
+        points: _pathPoints,
+        color: _trackedUserColor,
+        width: 3,
+      ));
+    }
+  }
+
+  double calculateDistance(double lat1, double lon1, double lat2, double lon2) {
+    const R = 6371e3;
+    final phi1 = lat1 * pi / 180;
+    final phi2 = lat2 * pi / 180;
+    final deltaPhi = (lat2 - lat1) * pi / 180;
+    final deltaLambda = (lon2 - lon1) * pi / 180;
+
+    final a = sin(deltaPhi / 2) * sin(deltaPhi / 2) +
+        cos(phi1) * cos(phi2) * sin(deltaLambda / 2) * sin(deltaLambda / 2);
+    final c = 2 * atan2(sqrt(a), sqrt(1 - a));
+
+    return R * c;
+  }
+
+  void _sendTrackingRequest() {
+    _stompClient.send(
+      destination: '/app/subscribe-to-user',
+      body: jsonEncode({
+        'requestingUserId': widget.requestingUserId,
+        'userIdToTrack': widget.userIdToTrack,
+      }),
+    );
+  }
+
+  void _updateMap(LatLng position) {
+    final markerId = MarkerId(widget.userIdToTrack);
+
+    setState(() {
+      _markers.remove(markerId);
+      _markers.add(Marker(
+        markerId: markerId,
+        position: position,
+        icon: BitmapDescriptor.defaultMarkerWithHue(
+          _getHueForColor(_trackedUserColor),
+        ),
+        infoWindow: InfoWindow(
+          title: 'Current Position',
+          snippet:
+              '${position.latitude.toStringAsFixed(6)}, ${position.longitude.toStringAsFixed(6)}',
+        ),
+      ));
+      _mapController.animateCamera(CameraUpdate.newLatLng(position));
+    });
+  }
+
+  void _addFootprint(LatLng position) {
+    setState(() {
+      _footprints.add(Circle(
+        circleId: CircleId(Uuid().v4()),
+        center: position,
+        radius: 5,
+        strokeWidth: 0,
+        fillColor: _trackedUserColor.withOpacity(0.7),
+      ));
+    });
+  }
+
+  double _getHueForColor(Color color) {
+    final hsl = HSLColor.fromColor(color);
+    return hsl.hue;
+  }
+
+  Widget _buildInfoBox(IconData icon, String title, String value) {
+    return Container(
+      width: 150,
+      padding: EdgeInsets.all(12),
+      margin: EdgeInsets.symmetric(horizontal: 8),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black12,
+            blurRadius: 4,
+            offset: Offset(0, 2),
+          ),
+        ],
+      ),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(icon, color: Colors.blue[800], size: 24),
+          SizedBox(height: 8),
+          Text(title, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+          SizedBox(height: 4),
+          Text(value,
+              style: TextStyle(
+                fontSize: 16,
+                fontWeight: FontWeight.bold,
+                color: Colors.blue[800],
+              )),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: Colors.white,
+        elevation: 0,
+        title: const Text(
+          "Live Location Tracking",
+          style: TextStyle(
+            color: Colors.black54,
+            fontSize: 20,
+            fontWeight: FontWeight.w400,
+          ),
+        ),
+        actions: [
+          IconButton(
+            splashRadius: 20,
+            icon: const Icon(Icons.notifications_active, color: Colors.black54),
+            onPressed: () {
+              // Navigate to notifications
+            },
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          // Map takes 75% of screen when info panel is collapsed
+          Expanded(
+            flex: 3,
+            child: Stack(
+              children: [
+                GoogleMap(
+                  onMapCreated: (controller) => _mapController = controller,
+                  initialCameraPosition: CameraPosition(
+                    target: LatLng(28.5892, 77.3176),
+                    zoom: 15,
+                  ),
+                  markers: _markers,
+                  circles: _footprints,
+                  polylines: _pathLines,
+                ),
+                Positioned(
+                  top: 10,
+                  right: 10,
+                  child: Container(
+                    padding: EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: _isConnected ? Colors.green : Colors.red,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Text(
+                      _isConnected ? 'Connected' : 'Disconnected',
+                      style: TextStyle(color: Colors.white),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          // Info panel takes 25% of screen when collapsed
+          Container(
+            height: MediaQuery.of(context).size.height * 0.25,
+            padding: EdgeInsets.symmetric(vertical: 12),
+            decoration: BoxDecoration(
+              color: Colors.grey[100],
+              borderRadius: BorderRadius.only(
+                topLeft: Radius.circular(20),
+                topRight: Radius.circular(20),
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black12,
+                  blurRadius: 10,
+                  offset: Offset(0, -5),
+                ),
+              ],
+            ),
+            child: Column(
+              children: [
+                // Draggable handle
+                Container(
+                  width: 40,
+                  height: 4,
+                  margin: EdgeInsets.only(bottom: 8),
+                  decoration: BoxDecoration(
+                    color: Colors.grey[400],
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+                // Horizontal scrollable info boxes
+                Expanded(
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: Row(
+                      children: [
+                        SizedBox(width: 8),
+                        // Current Location Box
+                        _buildInfoBox(
+                          Icons.location_pin,
+                          'Current Location',
+                          _currentPosition != null
+                              ? '${_currentPosition!.latitude.toStringAsFixed(4)}\n${_currentPosition!.longitude.toStringAsFixed(4)}'
+                              : '--\n--',
+                        ),
+                        // Last Update Box
+                        _buildInfoBox(
+                          Icons.access_time,
+                          'Last Update',
+                          _lastUpdateTime != null
+                              ? _timeFormat.format(_lastUpdateTime!)
+                              : '--:--:--',
+                        ),
+                        // Tracking Since Box
+                        _buildInfoBox(
+                          Icons.calendar_today,
+                          'Tracking Since',
+                          _trackingStartTime != null
+                              ? _dateFormat.format(_trackingStartTime!)
+                              : '--/--/----',
+                        ),
+                        // Distance Box
+                        _buildInfoBox(
+                          Icons.directions_walk,
+                          'Distance Walked',
+                          '${(_totalDistance / 1000).toStringAsFixed(2)} km',
+                        ),
+                        // Footprints Box
+                        _buildInfoBox(
+                          Icons.person,
+                          'Footprints',
+                          '${_footprints.length}',
+                        ),
+                        SizedBox(width: 8),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}

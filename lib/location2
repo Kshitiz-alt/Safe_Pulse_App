@@ -1,0 +1,201 @@
+// import 'package:flutter/material.dart';
+// import 'package:google_maps_flutter/google_maps_flutter.dart';
+// import 'package:location/location.dart';
+// import 'package:Safe_pulse/Background/background_service.dart';
+
+// class MapScreen extends StatefulWidget {
+//   @override
+//   _MapScreenState createState() => _MapScreenState();
+// }
+
+// class _MapScreenState extends State<MapScreen> {
+//   GoogleMapController? _mapController;
+//   Location _location = Location();
+//   Set<Polyline> _polylines = {};
+//   List<LatLng> _pathPoints = [];
+//   List<LatLng> _pathPointsback =
+//       []; // New list to store path points temporarily
+//   LatLng? _initialPosition;
+//   bool _isLoading = true;
+//   @override
+//   void initState() {
+//     super.initState();
+//     _initLocation();
+//     _startTimer();
+//     // initializeService(); // Start the background service
+//   }
+
+//   void _initLocation() async {
+//     try {
+//       bool serviceEnabled = await _location.serviceEnabled();
+//       if (!serviceEnabled) {
+//         serviceEnabled = await _location.requestService();
+//         if (!serviceEnabled) {
+//           print("Location service is not enabled.");
+//           return;
+//         }
+//       }
+
+//       PermissionStatus permissionGranted = await _location.hasPermission();
+//       if (permissionGranted == PermissionStatus.denied) {
+//         permissionGranted = await _location.requestPermission();
+//         if (permissionGranted != PermissionStatus.granted) {
+//           print("Location permission denied.");
+//           return;
+//         }
+//       }
+
+//       // Get the initial location
+//       LocationData currentLocation = await _location.getLocation();
+//       if (currentLocation.latitude != null &&
+//           currentLocation.longitude != null) {
+//         setState(() {
+//           _initialPosition =
+//               LatLng(currentLocation.latitude!, currentLocation.longitude!);
+//           _pathPoints
+//               .add(_initialPosition!); // Add the initial position to the path
+//           _isLoading = false; // Stop loading
+//         });
+
+//         // Move the camera to the initial position
+//         _mapController
+//             ?.animateCamera(CameraUpdate.newLatLng(_initialPosition!));
+//       }
+
+//       // Listen for location updates
+//       _location.onLocationChanged.listen((LocationData currentLocation) {
+//         if (currentLocation.latitude != null &&
+//             currentLocation.longitude != null) {
+//           LatLng newPosition =
+//               LatLng(currentLocation.latitude!, currentLocation.longitude!);
+//           setState(() {
+//             _pathPoints.add(newPosition);
+//             _pathPointsback
+//                 .add(newPosition); // Add new position to the backup list
+//             _polylines.add(Polyline(
+//               polylineId: PolylineId('path'),
+//               points: _pathPoints,
+//               color: const Color.fromARGB(255, 125, 207, 47),
+//               width: 5,
+//             ));
+//           });
+
+//           _mapController?.animateCamera(CameraUpdate.newLatLng(newPosition));
+//         }
+//       });
+//     } catch (e) {
+//       print("Error: $e");
+//     }
+//   }
+
+//   void _startTimer() {
+//     // Timer to send data every 10 seconds
+//     Future.delayed(Duration(seconds: 10), () {
+//       if (_pathPointsback.isNotEmpty) {
+//         _sendDataToBackend(); // Send data to backend
+//         _pathPointsback.clear(); // Clear the backup list
+//       }
+//       _startTimer(); // Restart the timer
+//     });
+//   }
+
+//   void _sendDataToBackend() {
+//     // Simulate sending data to backend (bypassing actual backend call)
+//     print("Sending data to backend: $_pathPointsback");
+//     print("Sending data to backend:2 $_pathPoints");
+//     // Here you can add your actual backend API call
+//   }
+
+//   void _centerMapOnUser() async {
+//     LocationData currentLocation = await _location.getLocation();
+//     if (currentLocation.latitude != null && currentLocation.longitude != null) {
+//       _mapController?.animateCamera(
+//         CameraUpdate.newLatLng(
+//           LatLng(currentLocation.latitude!, currentLocation.longitude!),
+//         ),
+//       );
+//     }
+//   }
+
+//   @override
+//   Widget build(BuildContext context) {
+//     return Scaffold(
+//       appBar: AppBar(
+//         title: Text(
+//           'Path Tracker',
+//           style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+//         ),
+//         centerTitle: true,
+//         flexibleSpace: Container(
+//           decoration: BoxDecoration(
+//             gradient: LinearGradient(
+//               colors: [
+//                 const Color.fromARGB(255, 125, 207, 47),
+//                 const Color.fromARGB(255, 125, 207, 47)
+//               ],
+//               begin: Alignment.topLeft,
+//               end: Alignment.bottomRight,
+//             ),
+//           ),
+//         ),
+//       ),
+//       body: _isLoading
+//           ? Center(
+//               child: Column(
+//                 mainAxisAlignment: MainAxisAlignment.center,
+//                 children: [
+//                   CircularProgressIndicator(
+//                     valueColor: AlwaysStoppedAnimation<Color>(
+//                         const Color.fromARGB(255, 125, 207, 47)),
+//                   ),
+//                   SizedBox(height: 20),
+//                   Text(
+//                     'Fetching your location...',
+//                     style: TextStyle(
+//                       fontSize: 16,
+//                       color: Colors.grey[700],
+//                     ),
+//                   ),
+//                 ],
+//               ),
+//             )
+//           : Stack(
+//               children: [
+//                 GoogleMap(
+//                   onMapCreated: (GoogleMapController controller) {
+//                     _mapController = controller;
+//                   },
+//                   initialCameraPosition: CameraPosition(
+//                     target: _initialPosition ?? LatLng(0, 0),
+//                     zoom: 15,
+//                   ),
+//                   polylines: _polylines,
+//                   myLocationEnabled: true,
+//                   myLocationButtonEnabled: false, // Disable default button
+//                   markers: _initialPosition != null
+//                       ? {
+//                           Marker(
+//                             markerId: MarkerId('start'),
+//                             position: _initialPosition!,
+//                             infoWindow: InfoWindow(title: 'Start Point'),
+//                             icon: BitmapDescriptor.defaultMarkerWithHue(
+//                               BitmapDescriptor.hueGreen, // Green marker
+//                             ),
+//                           ),
+//                         }
+//                       : {},
+//                 ),
+//                 Positioned(
+//                   bottom: 20,
+//                   right: 70,
+//                   child: FloatingActionButton(
+//                     onPressed: _centerMapOnUser,
+//                     child: Icon(Icons.my_location, color: Colors.white),
+//                     backgroundColor: const Color.fromARGB(255, 125, 207, 47),
+//                   ),
+//                 ),
+//               ],
+//             ),
+//     );
+//   }
+// }

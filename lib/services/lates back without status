@@ -1,0 +1,259 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:developer';
+import 'dart:ui';
+
+import 'package:flutter/material.dart';
+import 'package:flutter_background_service/flutter_background_service.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:hive/hive.dart';
+import 'package:hive_flutter/hive_flutter.dart';
+import 'package:http/http.dart' as http;
+import 'package:Safe_pulse/Api/ApiService.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:stomp_dart_client/stomp_dart_client.dart';
+
+// Hive box names
+const String pendingLocationsBoxName = 'pending_locations';
+const String lastLocationBoxName = 'last_location';
+
+// Initialize Hive
+Future<void> initHive() async {
+  await Hive.initFlutter();
+  await Hive.openBox<List<dynamic>>(pendingLocationsBoxName);
+  await Hive.openBox<Map<String, dynamic>>(lastLocationBoxName);
+}
+
+Future<void> initializeService() async {
+  await initHive();
+  final service = FlutterBackgroundService();
+  await service.configure(
+    androidConfiguration: AndroidConfiguration(
+      onStart: onStart,
+      autoStart: true,
+      isForegroundMode: true,
+      autoStartOnBoot: true,
+      notificationChannelId: 'location_service',
+      initialNotificationTitle: 'Location Tracking',
+      initialNotificationContent: 'Running in background',
+      foregroundServiceNotificationId: 888,
+    ),
+    iosConfiguration: IosConfiguration(
+      autoStart: true,
+      onForeground: onStart,
+      onBackground: onIosBackground,
+    ),
+  );
+}
+
+@pragma('vm:entry-point')
+Future<bool> onIosBackground(ServiceInstance service) async {
+  WidgetsFlutterBinding.ensureInitialized();
+  DartPluginRegistrant.ensureInitialized();
+  return true;
+}
+
+@pragma('vm:entry-point')
+void onStart(ServiceInstance service) async {
+  DartPluginRegistrant.ensureInitialized();
+  await initHive();
+
+  // Get Hive boxes first
+  final Box<List<dynamic>> pendingLocationsBox =
+      Hive.box<List<dynamic>>(pendingLocationsBoxName);
+  final Box<Map<String, dynamic>> lastLocationBox =
+      Hive.box<Map<String, dynamic>>(lastLocationBoxName);
+
+  // Initialize WebSocket client
+  StompClient? stompClient;
+  String? userEmail;
+  String? userId;
+  bool isWebSocketConnected = false;
+
+  // Variables to track last saved location and time
+  Position? lastSavedPosition;
+  DateTime? lastSavedTime;
+
+  // Get user data from SharedPreferences
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    userEmail = prefs.getString("username");
+    userId = prefs.getString("userId");
+    print("User data: $userId $userEmail");
+  } catch (e) {
+    log("Error getting user data: $e");
+  }
+
+  // Function to send pending locations via API
+  Future<void> sendPendingLocations() async {
+    final pending = pendingLocationsBox
+        .get('locations', defaultValue: <dynamic>[]) as List<dynamic>;
+    if (pending.isEmpty || userEmail == null) return;
+
+    try {
+      final url = Uri.parse(
+          '${ApiService.baseUrl}/api/rest/bulk-location-save?username=$userEmail');
+      final headers = {'Content-Type': 'application/json'};
+      final body = jsonEncode(pending);
+
+      final response = await http.post(url, headers: headers, body: body);
+
+      if (response.statusCode == 200) {
+        log("Successfully sent ${pending.length} pending locations ${jsonEncode(pending)}");
+        await pendingLocationsBox.put('locations', <dynamic>[]);
+      } else {
+        log("Failed to send pending locations: ${response.statusCode}");
+      }
+    } catch (e) {
+      log("Error sending pending locations: $e");
+    }
+  }
+
+  // Save pending locations to Hive
+  Future<void> savePendingLocation(Map<String, dynamic> location) async {
+    try {
+      final pending = pendingLocationsBox
+          .get('locations', defaultValue: <dynamic>[]) as List<dynamic>;
+      final newPending = List<dynamic>.from(pending)..add(location);
+      await pendingLocationsBox.put('locations', newPending);
+    } catch (e) {
+      log("Error saving pending location: $e");
+    }
+  }
+
+  // Save last saved position and time to Hive
+  Future<void> saveLastSavedData(Position position) async {
+    try {
+      await lastLocationBox.putAll({
+        'position': {
+          'latitude': position.latitude,
+          'longitude': position.longitude,
+          'time': DateTime.now().toIso8601String(),
+        },
+      });
+    } catch (e) {
+      log("Error saving last saved data: $e");
+    }
+  }
+
+  // Setup WebSocket connection
+  void connectWebSocket() {
+    stompClient = StompClient(
+      config: StompConfig.sockJS(
+        url: '${ApiService.baseUrl}//ws-location',
+        onConnect: (StompFrame frame) async {
+          log("WebSocket connected");
+          isWebSocketConnected = true;
+          await sendPendingLocations();
+        },
+        onDisconnect: (frame) {
+          log("WebSocket disconnected");
+          isWebSocketConnected = false;
+        },
+        onWebSocketError: (dynamic error) {
+          log("WebSocket error: $error");
+          isWebSocketConnected = false;
+        },
+        reconnectDelay: const Duration(seconds: 5),
+      ),
+    );
+    stompClient?.activate();
+  }
+
+  // Connect to WebSocket
+  connectWebSocket();
+
+  if (service is AndroidServiceInstance) {
+    service.setAsForegroundService();
+    service.on('setAsForeground').listen((event) {
+      service.setAsForegroundService();
+    });
+    service.on('setAsBackground').listen((event) {
+      service.setAsBackgroundService();
+    });
+  }
+
+  service.on('stopService').listen((event) {
+    stompClient?.deactivate();
+    service.stopSelf();
+  });
+
+  // Timer for frequent location updates (every 2-3 seconds)
+  Timer.periodic(const Duration(seconds: 3), (timer) async {
+    if (await Permission.locationAlways.isDenied) {
+      if (service is AndroidServiceInstance) {
+        if (await service.isForegroundService()) {
+          await service.setForegroundNotificationInfo(
+            title: "Permission Denied",
+            content: "Waiting for location permission",
+          );
+        }
+      }
+      service.invoke('update');
+    } else {
+      try {
+        Position position = await Geolocator.getCurrentPosition(
+            desiredAccuracy: LocationAccuracy.high);
+
+        if (service is AndroidServiceInstance) {
+          if (await service.isForegroundService()) {
+            await service.setForegroundNotificationInfo(
+              title: "Your location",
+              content: "${position.latitude},${position.longitude}",
+            );
+          }
+        }
+
+        service.invoke('update');
+
+        // Always prepare location data (no distance check)
+        final location = {
+          'latitude': position.latitude,
+          'longitude': position.longitude,
+          'timestamp': DateTime.now().toIso8601String(),
+          'userId': userId,
+        };
+
+        // Try to send via WebSocket if connected
+        if (isWebSocketConnected && userId != null && userEmail != null) {
+          try {
+            stompClient?.send(
+              destination: '/app/update-location',
+              body: jsonEncode({
+                'latitude': position.latitude,
+                'longitude': position.longitude,
+                'userId': userId,
+              }),
+            );
+            log("Location data sent via WebSocket: ${position.latitude},${position.longitude}");
+
+            // Update last saved position and time
+            lastSavedPosition = position;
+            lastSavedTime = DateTime.now();
+            await saveLastSavedData(position);
+          } catch (e) {
+            log("WebSocket send error, storing locally: $e");
+            await savePendingLocation(location);
+            lastSavedPosition = position;
+            lastSavedTime = DateTime.now();
+            await saveLastSavedData(position);
+            connectWebSocket();
+          }
+        } else {
+          log("WebSocket not connected or user data missing - storing locally");
+          await savePendingLocation(location);
+          lastSavedPosition = position;
+          lastSavedTime = DateTime.now();
+          await saveLastSavedData(position);
+
+          if (!isWebSocketConnected) {
+            connectWebSocket();
+          }
+        }
+      } catch (e) {
+        log("Error in background service: $e");
+      }
+    }
+  });
+}

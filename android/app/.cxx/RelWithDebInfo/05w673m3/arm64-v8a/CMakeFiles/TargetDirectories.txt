@@ -1,0 +1,2 @@
+D:/Safe_Pulse_App/Safe_Pulse_App/android/app/.cxx/RelWithDebInfo/05w673m3/arm64-v8a/CMakeFiles/edit_cache.dir
+D:/Safe_Pulse_App/Safe_Pulse_App/android/app/.cxx/RelWithDebInfo/05w673m3/arm64-v8a/CMakeFiles/rebuild_cache.dir
